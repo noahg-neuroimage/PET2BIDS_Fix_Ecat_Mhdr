@@ -166,12 +166,7 @@ def ecat2nii(
 
     # format data into acceptable shape for nibabel, by first creating empty matrix
     img_temp = numpy.zeros(
-        shape=(
-            sub_headers[0]["X_DIMENSION"],
-            sub_headers[0]["Y_DIMENSION"],
-            sub_headers[0]["Z_DIMENSION"],
-            main_header["NUM_FRAMES"],
-        ),
+        shape=shape_from_headers,
         dtype=">f4",
     )
 
