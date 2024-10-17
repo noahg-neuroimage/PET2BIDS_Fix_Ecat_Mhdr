@@ -174,7 +174,7 @@ def cli():
         help="Update/create a json sidecar file from an ECAT given a path to that each "
         "file,. e.g."
         "ecatpet2bids ecatfile.v --update path/to/sidecar.json "
-        "additionally one can pass metadat to the sidecar via inclusion of the "
+        "additionally one can pass metadata to the sidecar via inclusion of the "
         "--kwargs flag or"
         "the --metadata-path flag. If both are included the --kwargs flag will "
         "override any"
@@ -190,6 +190,14 @@ def cli():
         action="version",
         version=f"{helper_functions.get_version()}",
     )
+    parser.add_argument(
+        "--notrack",
+        action="store_true",
+        default=False,
+        help="Opt-out of sending tracking information of this run to the PET2BIDS developers. "
+        "This information helps to improve PET2BIDS and provides an indicator of real world "
+        "usage crucial for obtaining funding.",
+    )
 
     return parser
 
@@ -201,7 +209,7 @@ Usage examples are below, the first being the most brutish way of injecting BIDS
 into the output from ecatpet2bids. Additional arguments/fields are passed via the kwargs flag
 in key value pairs.
 
-example 1 (Passing PET metadat via the --kwargs argument):
+example 1 (Passing PET metadata via the --kwargs argument):
     
     # Note `#` denotes a comment
     
@@ -261,6 +269,9 @@ def main():
     if cli_args.show_examples:
         print(example1)
         sys.exit(0)
+
+    if cli_args.notrack:
+        os.environ["PET2BIDS_TELEMETRY_ENABLED"] = "False"
 
     collect_pixel_data = False
     if cli_args.convert or cli_args.update:
