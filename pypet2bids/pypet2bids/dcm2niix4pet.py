@@ -175,6 +175,7 @@ class Dcm2niix4PET:
         file_format="%p_%i_%t_%s",
         silent=False,
         tempdir_location=None,
+        ezbids=False
     ):
         """
         This class is a simple wrapper for dcm2niix and contains methods to do the following in order:
@@ -215,6 +216,7 @@ class Dcm2niix4PET:
         self.blood_json = None
         self.blood_tsv = None
         self.telemetry_data = {}
+        self.ezbids=ezbids
         self.dcm2niix_path = self.check_for_dcm2niix()
         if not self.dcm2niix_path:
             logger.error(
@@ -300,6 +302,15 @@ class Dcm2niix4PET:
         self.dicom_headers = self.extract_dicom_headers()
         # we consider values stored in a default JSON file to be additional arguments, we load those
         # values first and then overwrite them with any user supplied values
+
+        # check to make sure the dicom is a PET dicom
+        modalities = [dicom.Modality for dicom in self.dicom_headers.values()]
+        non_pet_dicom = [modality for modality in modalities if modality != "PT"]
+
+        if len(non_pet_dicom) > 0:
+            logger.warning(
+                f"Non PET dicoms found in {self.image_folder}. Modalities f{non_pet_dicom} detected"
+            )
 
         # load config file
         default_json_path = helper_functions.check_pet2bids_config(
@@ -500,6 +511,32 @@ class Dcm2niix4PET:
                 join(tempdir_pathlike, file) for file in listdir(tempdir_pathlike)
             ]
 
+            # check to see if there are any modalities present that aren't PET
+            remove_these_non_pet_files = []
+            for json_file in [f for f in files_created_by_dcm2niix if ".json" in f]:
+                with open(json_file, "r") as infile:
+                    json_data = json.load(infile)
+                    if json_data.get("Modality") != "PT":
+                        logger.warning(
+                            f"Non PET modality found in {json_file}, skipping. Files relating to this json and it's"
+                            f"nifti will not be included at the destination folder {self.destination_folder}"
+                        )
+                        remove_these_non_pet_files.append(json_file)
+                        remove_these_non_pet_files.append(
+                            json_file.replace(".json", ".nii.gz")
+                        )
+                        remove_these_non_pet_files.append(
+                            json_file.replace(".json", ".nii")
+                        )
+
+            # if there are non PET files remove them from files_created_by_dcm2niix
+            if remove_these_non_pet_files:
+                for file in remove_these_non_pet_files:
+                    try:
+                        files_created_by_dcm2niix.remove(file)
+                    except ValueError:
+                        pass
+
             # make sure destination path exists if not try creating it.
             try:
                 if self.destination_path.exists():
@@ -553,7 +590,8 @@ class Dcm2niix4PET:
                             created_path,
                             check_for_missing,
                             dicom_header,
-                            dicom2bids_json=metadata_dictionaries["dicom2bids.json"],
+                            dicom2bids_json=metadata_dictionaries["dicom2bids"],
+                            ezbids=self.ezbids,
                             **self.additional_arguments,
                         )
 
@@ -689,6 +727,16 @@ class Dcm2niix4PET:
                     # made by this software as the input provided by the user is "the correct input"
                     sidecar_json.update(self.spreadsheet_metadata.get("nifti_json", {}))
                     sidecar_json.update(self.additional_arguments)
+
+                    # set ModeOfAdministration to lower case
+                    if sidecar_json.get("ModeOfAdministration"):
+                        sidecar_json.update(
+                            {
+                                "ModeOfAdministration": sidecar_json.get(
+                                    "ModeOfAdministration"
+                                ).lower()
+                            }
+                        )
 
                     # this is mostly for ezBIDS, but it helps us to make better use of the series description that
                     # dcm2niix generates by default for PET imaging
@@ -1117,6 +1165,13 @@ def cli():
         "This information helps to improve PET2BIDS and provides an indicator of real world "
         "usage crucial for obtaining funding.",
     )
+    parser.add_argument(
+        "--ezbids",
+        action="store_true",
+        default=False,
+        help="Add fields to json output that are useful for ezBIDS or other conversion software. This will de-anonymize"
+             " pet2bids output and add AcquisitionDate an AcquisitionTime into the output json."
+    )
     return parser
 
 
@@ -1283,6 +1338,7 @@ def main():
             additional_arguments=cli_args.kwargs,
             tempdir_location=cli_args.tempdir,
             silent=cli_args.silent,
+            ezbids=cli_args.ezbids,
         )
 
         if cli_args.trc:

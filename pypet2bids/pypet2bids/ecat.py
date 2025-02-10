@@ -244,7 +244,7 @@ class Ecat:
         self.telemetry_data["NiftiFiles"] = 1
         self.telemetry_data["NiftiFilesSize"] = pathlib.Path(output).stat().st_size
 
-        if "nii.gz" not in output:
+        if "nii.gz" not in pathlib.Path(output).name:
             output = helper_functions.compress(output)
 
         return output
@@ -452,6 +452,12 @@ class Ecat:
         # lastly infer radio data if we have it
         meta_radio_inputs = check_meta_radio_inputs(self.sidecar_template)
         self.sidecar_template.update(**meta_radio_inputs)
+
+        # set ModeOfAdministration to lower case
+        if self.sidecar_template.get("ModeOfAdministration", ""):
+            self.sidecar_template["ModeOfAdministration"] = self.sidecar_template[
+                "ModeOfAdministration"
+            ].lower()
 
     def prune_sidecar(self):
         """

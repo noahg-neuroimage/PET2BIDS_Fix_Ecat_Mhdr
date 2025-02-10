@@ -9,52 +9,28 @@ import argparse
 import pydicom
 import datetime
 from typing import Union
+from pandas import Timestamp
 
 try:
     import helper_functions
     import is_pet
+    import metadata
 except ModuleNotFoundError:
     import pypet2bids.helper_functions as helper_functions
     import pypet2bids.is_pet as is_pet
+    import pypet2bids.metadata as metadata
 
 # import logging
 logger = helper_functions.logger("pypet2bids")
 
-# load module and metadata_json paths from helper_functions
-module_folder, metadata_folder = (
-    helper_functions.module_folder,
-    helper_functions.metadata_folder,
-)
-
-try:
-    # collect metadata jsons in dev mode
-    metadata_jsons = [
-        Path(join(metadata_folder, metadata_json))
-        for metadata_json in listdir(metadata_folder)
-        if ".json" in metadata_json
-    ]
-except FileNotFoundError:
-    metadata_jsons = [
-        Path(join(module_folder, "metadata", metadata_json))
-        for metadata_json in listdir(join(module_folder, "metadata"))
-        if ".json" in metadata_json
-    ]
-
 # create a dictionary to house the PET metadata files
-metadata_dictionaries = {}
-
-for metadata_json in metadata_jsons:
-    try:
-        with open(metadata_json, "r") as infile:
-            dictionary = json.load(infile)
-
-        metadata_dictionaries[metadata_json.name] = dictionary
-    except FileNotFoundError as err:
-        raise Exception(
-            f"Missing pet metadata file {metadata_json} in {metadata_folder}, unable to validate metadata."
-        )
-    except json.decoder.JSONDecodeError as err:
-        raise IOError(f"Unable to read from {metadata_json}")
+metadata_dictionaries = {
+    "blood_metadata": metadata.blood_metadata,
+    "dicom2bids": metadata.dicom2bids,
+    "PET_reconstruction_methods": metadata.PET_reconstruction_methods,
+    "schema": metadata.schema,
+    "PET_metadata": metadata.PET_metadata
+}
 
 
 def check_json(
@@ -95,7 +71,7 @@ def check_json(
 
     # check for default argument for dictionary of items to check
     if items_to_check is None:
-        items_to_check = metadata_dictionaries["PET_metadata.json"]
+        items_to_check = metadata_dictionaries["PET_metadata"]
         # remove blood tsv data from items to check
         if items_to_check.get("blood_recording_fields", None):
             items_to_check.pop("blood_recording_fields")
@@ -173,6 +149,7 @@ def update_json_with_dicom_value(
     dicom_header,
     dicom2bids_json=None,
     silent=True,
+    ezbids=False,
     **additional_arguments,
 ):
     """
@@ -184,6 +161,9 @@ def update_json_with_dicom_value(
     :param missing_values: dictionary output from check_json indicating missing fields and/or values
     :param dicom_header: the dicom or dicoms that may contain information not picked up by dcm2niix
     :param dicom2bids_json: a json file that maps dicom header entities to their corresponding BIDS entities
+    :param silent: run silently without error, status, or warning messages
+    :param ezbids: boolean to supply additional data that ezbids or other software requires, defaults to false. When
+    true the sidecar json will be updated with AcquisitionDate, AcquisitionTime, and AcquisitionDateTime
     :return: a dictionary of successfully updated (written to the json file) fields and values
     """
 
@@ -320,6 +300,20 @@ def update_json_with_dicom_value(
 
     # remove scandate if it exists
     json_updater.remove("ScanDate")
+
+    # lastly if ezbids is true update the sidecar with acquisition data
+    if ezbids:
+        acquisition_date = parser.parse(dicom_header.get("AcquisitionDate", ""))
+        acquisition_time = parser.parse(dicom_header.get("AcquisitionTime", ""))
+        if acquisition_time and acquisition_date:
+            acquisition_datetime = datetime.datetime.combine(acquisition_date.date(), acquisition_time.time())
+        else:
+            acquisition_datetime = "0000-00-00T00:00:00"
+        json_updater.update(
+            {"AcquisitionDate": f"{acquisition_date.date()}",
+             "AcquisitionTime": f"{acquisition_time.time()}",
+             "AcquisitionDateTime": f"{acquisition_datetime.isoformat()}"
+             })
 
     # after updating raise warnings to user if values in json don't match values in dicom headers, only warn!
     updated_values = json.load(open(path_to_json, "r"))
@@ -496,7 +490,7 @@ def get_radionuclide(pydicom_dicom):
 
     if extraction_good:
         # check to see if these nucleotides appear in our verified values
-        verified_nucleotides = metadata_dictionaries["dicom2bids.json"][
+        verified_nucleotides = metadata_dictionaries["dicom2bids"][
             "RadionuclideCodes"
         ]
 
@@ -774,19 +768,6 @@ def get_metadata_from_spreadsheet(
             **additional_arguments,
         )
 
-    # remove any dates from the spreadsheet time values
-    for key, value in spreadsheet_values.items():
-        if "time" in key.lower():
-            if isinstance(value, str):
-                # check to see if the value converts to a datetime object with a date
-                try:
-                    time_value = parser.parse(value).time().strftime("%H:%M:%S")
-                    spreadsheet_values[key] = time_value
-                except ValueError:
-                    pass
-            if isinstance(value, datetime.datetime):
-                spreadsheet_values[key] = value.time().strftime("%H:%M:%S")
-
     if Path(metadata_path).is_dir() or metadata_path == "":
         # we accept folder input as well as no input, in the
         # event of no input we search for spreadsheets in the
@@ -808,6 +789,24 @@ def get_metadata_from_spreadsheet(
                     **additional_arguments,
                 )
             )
+
+        # remove any dates from the spreadsheet time values
+    for key, value in spreadsheet_values.items():
+        if "time" in key.lower():
+            if isinstance(value, str):
+                # check to see if the value converts to a datetime object with a date
+                try:
+                    time_value = parser.parse(value).time().strftime("%H:%M:%S")
+                    spreadsheet_values[key] = time_value
+                except ValueError:
+                    pass
+            elif isinstance(value, datetime.datetime):
+                spreadsheet_values[key] = value.time().strftime("%H:%M:%S")
+            elif isinstance(value, Timestamp):
+                value = value.to_pydatetime()
+                spreadsheet_values[key] = value.time().strftime("%H:%M:%S")
+            else:
+                pass
 
     # check for any blood (tsv) data or otherwise in the given spreadsheet values
     blood_tsv_columns = [
