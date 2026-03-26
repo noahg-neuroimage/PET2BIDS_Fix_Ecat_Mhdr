@@ -20,6 +20,7 @@ from platform import system
 import subprocess
 import pandas as pd
 from os.path import join
+from os import chmod
 from os import listdir, walk, environ
 from pathlib import Path
 import json
@@ -29,6 +30,8 @@ from tempfile import TemporaryDirectory
 import shutil
 import argparse
 import importlib
+import zipfile
+import stat
 
 try:
     import helper_functions
@@ -82,16 +85,24 @@ if pypet2bids_config.exists():
     default_metadata_json = helper_functions.check_pet2bids_config(
         "DEFAULT_METADATA_JSON"
     )
-    if default_metadata_json and Path(default_metadata_json).exists():
+    if default_metadata_json and Path(str(default_metadata_json)).exists():
         # do nothing
         pass
-    else:
+    elif default_metadata_json and not Path(str(default_metadata_json)).exists():
+        # Copy template to the specified path
         try:
+            # Ensure the parent directory exists before copying
+            Path(default_metadata_json).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(
                 Path(metadata_folder) / "template_json.json", default_metadata_json
             )
         except FileNotFoundError:
+            # Fallback to module folder template
+            Path(default_metadata_json).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(module_folder / "template_json.json", default_metadata_json)
+    else:
+        # No DEFAULT_METADATA_JSON set in config, do nothing
+        pass
 else:
     # if it doesn't exist use the default one included in this library
     helper_functions.modify_config_file(
@@ -164,6 +175,50 @@ def collect_date_time_from_file_name(file_name):
     return date, time
 
 
+def use_included_binary():
+    # get system platform
+    systems_system = system().lower()
+    module_folder = Path(__file__).parent.resolve()
+    binary_folder = module_folder / "dcm2niix_binaries"
+    dcm2niix_zip = "dcm2niix_{}.zip"
+    if "darwin" in systems_system:
+        zipped = binary_folder / dcm2niix_zip.format("mac")
+    elif "linux" in systems_system:
+        zipped = binary_folder / dcm2niix_zip.format("lnx")
+    elif "windows" in systems_system:
+        zipped = binary_folder / dcm2niix_zip.format("win")
+    else:
+        raise ValueError(
+            f"System must be Darwin, Linux, or Windows to use included binaries, got {system()}"
+        )
+
+    # Check if binary already exists
+    if systems_system == "windows":
+        dcm2niix_binary = binary_folder / "dcm2niix.exe"
+    else:
+        dcm2niix_binary = binary_folder / "dcm2niix"
+
+    # Only extract if binary doesn't exist
+    if not dcm2niix_binary.exists() and zipped.exists():
+        try:
+            with zipfile.ZipFile(zipped, "r") as ref:
+                ref.extractall(zipped.parent)
+        except zipfile.BadZipFile as e:
+            logger.error(
+                f"Unable to extract {zipped}, try manually setting DCM2NIIX_PATH in env or .pypet2bids_config"
+            )
+            raise e
+
+    # Check to make sure binary is there and set permissions
+    if dcm2niix_binary.exists():
+        if systems_system != "windows":
+            chmod(dcm2niix_binary, stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        helper_functions.modify_config_file("DCM2NIIX_PATH", dcm2niix_binary)
+        return dcm2niix_binary
+    else:
+        return None
+
+
 class Dcm2niix4PET:
     def __init__(
         self,
@@ -172,10 +227,12 @@ class Dcm2niix4PET:
         metadata_path=None,
         metadata_translation_script=None,
         additional_arguments={},
+        dcm2niix_options="",
         file_format="%p_%i_%t_%s",
         silent=False,
         tempdir_location=None,
-        ezbids=False
+        ezbids=False,
+        ignore_dcm2niix_errors=False,
     ):
         """
         This class is a simple wrapper for dcm2niix and contains methods to do the following in order:
@@ -216,14 +273,14 @@ class Dcm2niix4PET:
         self.blood_json = None
         self.blood_tsv = None
         self.telemetry_data = {}
-        self.ezbids=ezbids
+        self.ezbids = ezbids
         self.dcm2niix_path = self.check_for_dcm2niix()
         if not self.dcm2niix_path:
             logger.error(
                 "dcm2niix not found, this module depends on it for conversions, exiting."
             )
             sys.exit(1)
-
+        self.ignore_dcm2niix_errors = ignore_dcm2niix_errors
         # check for the version of dcm2niix
         minimum_version = "v1.0.20220720"
         version_string = subprocess.run([self.dcm2niix_path, "-v"], capture_output=True)
@@ -363,6 +420,42 @@ class Dcm2niix4PET:
                 load_spreadsheet_data["blood_json"]
             )
 
+            # we default to these options, a user may supply their own combination, this will allow full customization of all
+        # but the file arguments for dcm2niix
+        if dcm2niix_options:
+            # Filter out -f flag and its value from custom options since file format is handled separately
+            options_list = dcm2niix_options.split()
+            filtered_options = []
+            i = 0
+            while i < len(options_list):
+                if options_list[i] == "-f" and i + 1 < len(options_list):
+                    # Skip -f and its value
+                    i += 2
+                else:
+                    filtered_options.append(options_list[i])
+                    i += 1
+            self.dcm2niix_options = " ".join(filtered_options)
+        else:
+            # Check for dcm2niix options in config file and environment variable
+            config_options = helper_functions.check_pet2bids_config(
+                "PET2BIDS_DCM2NIIX_OPTIONS"
+            )
+            env_options = environ.get("PET2BIDS_DCM2NIIX_OPTIONS")
+
+            # Priority: command line > environment variable > config file > default
+            if env_options:
+                self.dcm2niix_options = env_options
+                logger.info(
+                    f"Using dcm2niix options from environment variable: {env_options}"
+                )
+            elif config_options:
+                self.dcm2niix_options = config_options
+                logger.info(
+                    f"Using dcm2niix options from config file: {config_options}"
+                )
+            else:
+                self.dcm2niix_options = "-b y -w 1 -z y"
+                logger.debug("Using default dcm2niix options: -b y -w 1 -z y")
         self.file_format = file_format
         # we may want to include additional information to the sidecar, tsv, or json files generated after conversion
         # this variable stores the mapping between output files and a single dicom header used to generate those files
@@ -399,17 +492,21 @@ class Dcm2niix4PET:
             dcm2niix_path = helper_functions.check_pet2bids_config()
 
         if not dcm2niix_path:
-            pkged = "https://github.com/rordenlab/dcm2niix/releases"
-            instructions = "https://github.com/rordenlab/dcm2niix#install"
-            no_dcm2niix = f"""Unable to locate Dcm2niix on your system $PATH or using the path specified in 
-                        $HOME/.pypet2bidsconfig. Installation instructions for dcm2niix can be found here 
-                        {instructions} 
-                        and packaged versions can be found at 
-                        {pkged}
-                        Alternatively, you can set the path to dcm2niix in the config file at $HOME/.pet2bidsconfig
-                        using the command dcm2niix4pet --set-dcm2niix-path."""
-            logger.error(no_dcm2niix)
-            dcm2niix_path = None
+            # determine if osx or linux
+            dcm2niix_path = use_included_binary()
+
+            if not dcm2niix_path:
+                pkged = "https://github.com/rordenlab/dcm2niix/releases"
+                instructions = "https://github.com/rordenlab/dcm2niix#install"
+                no_dcm2niix = f"""Unable to locate Dcm2niix on your system $PATH or using the path specified in 
+                            $HOME/.pypet2bidsconfig. Installation instructions for dcm2niix can be found here 
+                            {instructions} 
+                            and packaged versions can be found at 
+                            {pkged}
+                            Alternatively, you can set the path to dcm2niix in the config file at $HOME/.pet2bidsconfig
+                            using the command dcm2niix4pet --set-dcm2niix-path."""
+                logger.error(no_dcm2niix)
+                dcm2niix_path = None
 
         return dcm2niix_path
 
@@ -419,8 +516,8 @@ class Dcm2niix4PET:
 
         :return: status code of the command dcm2niix -h
         """
-
-        if system().lower() != "windows":
+        operating_system = system().lower()
+        if operating_system != "windows":
             dcm2niix_path = self.check_posix()
             # fall back and check the config file if it's not on the path
             if not dcm2niix_path:
@@ -479,22 +576,30 @@ class Dcm2niix4PET:
             self.tempdir_location = tempdir_pathlike
             # people use screwy paths, we do this before running dcm2niix to account for that
             image_folder = helper_functions.sanitize_bad_path(self.image_folder)
-            cmd = f"{self.dcm2niix_path} -b y -w 1 -z y {file_format_args} -o {tempdir_pathlike} {image_folder}"
+            cmd = f"{self.dcm2niix_path} {self.dcm2niix_options} {file_format_args} -o {tempdir_pathlike} {image_folder}"
             convert = subprocess.run(cmd, shell=True, capture_output=True)
             self.telemetry_data["dcm2niix"] = {
                 "returncode": convert.returncode,
             }
             self.telemetry_data.update(count_output_files(self.tempdir_location))
 
-            if convert.returncode != 0:
+            if (
+                convert.returncode != 0
+                or "error" in convert.stderr.decode("utf-8").lower()
+            ) and not self.ignore_dcm2niix_errors:
                 print(
                     "Check output .nii files, dcm2iix returned these errors during conversion:"
                 )
+                # raise error if missing images is found
+                if "missing images" in convert.stderr.decode("utf8").lower():
+                    error_message = convert.stderr.decode("utf8").replace("Error:", "")
+                    error_message = f"{error_message}for dicoms in {image_folder}"
+                    raise FileNotFoundError(error_message)
                 if (
                     bytes("Skipping existing file name", "utf-8") not in convert.stdout
                     or convert.stderr
                 ):
-                    print(convert.stderr)
+                    print(convert.stderr.decode("utf-8"))
                 elif (
                     convert.returncode != 0
                     and bytes("Error: Check sorted order", "utf-8") in convert.stdout
@@ -665,10 +770,19 @@ class Dcm2niix4PET:
                             if re.search(
                                 r"\d+.\d+", sidecar_json.get("ConvolutionKernel")
                             ):
-                                recon_filter_size = re.search(
-                                    r"\d+.\d*", sidecar_json.get("ConvolutionKernel")
-                                )[0]
-                                recon_filter_size = float(recon_filter_size)
+                                try:
+                                    recon_filter_size = re.search(
+                                        r"\d+.\d*",
+                                        sidecar_json.get("ConvolutionKernel"),
+                                    )[0]
+                                    recon_filter_size = float(recon_filter_size)
+                                except ValueError:
+                                    # If float conversion fails, try splitting and take first part
+                                    match_str = re.search(
+                                        r"\d+.\d*",
+                                        sidecar_json.get("ConvolutionKernel"),
+                                    )[0]
+                                    recon_filter_size = float(match_str.split()[0])
                                 sidecar_json.update(
                                     {"ReconFilterSize": float(recon_filter_size)}
                                 )
@@ -763,9 +877,11 @@ class Dcm2niix4PET:
                     if self.session_id:
                         collection_of_fields["ses"] = self.session_id
 
-                    hash_string = helper_functions.hash_fields(**collection_of_fields)
-
-                    sidecar_json.update({"SeriesDescription": hash_string})
+                    if self.ezbids:
+                        hash_string = helper_functions.hash_fields(
+                            **collection_of_fields
+                        )
+                        sidecar_json.update({"SeriesDescription": hash_string})
 
                 # if there's a subject id rename the output file to use it
                 if self.subject_id:
@@ -854,6 +970,10 @@ class Dcm2niix4PET:
             if type(blood_tsv_data) is pd.DataFrame or type(blood_tsv_data) is dict:
                 if type(blood_tsv_data) is dict:
                     blood_tsv_data = pd.DataFrame(blood_tsv_data)
+                
+                # remove any empty rows
+                blood_tsv_data = helper_functions.remove_zero_rows(blood_tsv_data)
+
                 # write out blood_tsv using pandas csv write
                 blood_tsv_data.to_csv(
                     join(self.destination_folder, blood_file_name + ".tsv"),
@@ -1026,9 +1146,13 @@ epilog = textwrap.dedent(
     
     example usage:
     
-    dcm2niix4pet folder_with_pet_dicoms/ --destinationp-path sub-ValidBidSSubject/pet # the simplest conversion
+    dcm2niix4pet folder_with_pet_dicoms/ --destination-path sub-ValidBidSSubject/pet # the simplest conversion
     dcm2niix4pet folder_with_pet_dicoms/ --destination-path sub-ValidBidsSubject/pet --metadata-path metadata.xlsx \
     # use with an input spreadsheet
+    dcm2niix4pet folder_with_pet_dicoms/ --destination-path sub-ValidBidsSubject/pet --dcm2niix-options -v y -w 1 -z y \
+    # use with custom dcm2niix options
+    dcm2niix4pet --set-dcm2niix-options '-v y -w 1 -z y' \
+    # set default dcm2niix options in config file
     
 """
 )
@@ -1125,6 +1249,13 @@ def cli():
         type=pathlib.Path,
     )
     parser.add_argument(
+        "--set-dcm2niix-options",
+        help="Provide dcm2niix options to be used as defaults, writes to config "
+        f"file {Path.home()}/.pet2bidsconfig under the variable "
+        f"PET2BIDS_DCM2NIIX_OPTIONS. Example: --set-dcm2niix-options '-v y -w 1 -z y'",
+        type=str,
+    )
+    parser.add_argument(
         "--set-default-metadata-json",
         help="Provide a path to a default metadata file json file."
         "This file will be used to fill in missing metadata not"
@@ -1170,7 +1301,23 @@ def cli():
         action="store_true",
         default=False,
         help="Add fields to json output that are useful for ezBIDS or other conversion software. This will de-anonymize"
-             " pet2bids output and add AcquisitionDate an AcquisitionTime into the output json."
+        " pet2bids output and add AcquisitionDate an AcquisitionTime into the output json.",
+    )
+    parser.add_argument(
+        "--ignore-dcm2niix-errors",
+        action="store_true",
+        default=False,
+        help="Accept any NifTi produced by dcm2niix even if it contains errors. This flag should only be used for "
+        "batch processing and only if you're performing robust QC after the fact.",
+    )
+    parser.add_argument(
+        "--dcm2niix-options",
+        nargs="*",
+        default=[],
+        help="Additional dcm2niix options to pass through. Use the same format as dcm2niix command line. "
+        "Note: -f flag and its value will be filtered out as file format is handled separately. "
+        "You can also set default options using --set-dcm2niix-options or the PET2BIDS_DCM2NIIX_OPTIONS environment variable. "
+        "Example: --dcm2niix-options -v y -w 1 -z y",
     )
     return parser
 
@@ -1318,6 +1465,12 @@ def main():
         helper_functions.modify_config_file("DCM2NIIX_PATH", cli_args.set_dcm2niix_path)
         sys.exit(0)
 
+    if cli_args.set_dcm2niix_options:
+        helper_functions.modify_config_file(
+            "PET2BIDS_DCM2NIIX_OPTIONS", cli_args.set_dcm2niix_options
+        )
+        sys.exit(0)
+
     if cli_args.set_default_metadata_json:
         helper_functions.modify_config_file(
             "DEFAULT_METADATA_JSON", cli_args.set_default_metadata_json
@@ -1336,9 +1489,13 @@ def main():
                 cli_args.translation_script_path
             ),
             additional_arguments=cli_args.kwargs,
+            dcm2niix_options=(
+                " ".join(cli_args.dcm2niix_options) if cli_args.dcm2niix_options else ""
+            ),
             tempdir_location=cli_args.tempdir,
             silent=cli_args.silent,
             ezbids=cli_args.ezbids,
+            ignore_dcm2niix_errors=cli_args.ignore_dcm2niix_errors,
         )
 
         if cli_args.trc:

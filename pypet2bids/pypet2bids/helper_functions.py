@@ -42,27 +42,18 @@ from platform import system
 import importlib
 
 try:
-    import metadata
+    from importlib import metadata
 except ImportError:
-    from pypet2bids import metadata
+    import importlib_metadata as metadata
 
-parent_dir = pathlib.Path(__file__).parent.resolve()
-project_dir = parent_dir.parent.parent
-if "PET2BIDS" not in project_dir.parts:
-    project_dir = parent_dir
-
-metadata_dir = os.path.join(project_dir, "metadata")
-
-# check to see where the schema is at
-pet_metadata_json = os.path.join(metadata_dir, "PET_metadata.json")
-permalink_pet_metadata_json = "https://github.com/openneuropet/PET2BIDS/blob/76d95cf65fa8a14f55a4405df3fdec705e2147cf/metadata/PET_metadata.json"
-pet_reconstruction_metadata_json = os.path.join(
-    metadata_dir, "PET_reconstruction_methods.json"
-)
+try:
+    import pet_metadata as metadata
+except ImportError:
+    import pypet2bids.pet_metadata as metadata
 
 # load bids schema
 schema = metadata.schema
-
+pet_metadata = metadata.PET_metadata
 # putting these paths here as they are reused in dcm2niix4pet.py, update_json_pet_file.py, and ecat.py
 module_folder = Path(__file__).parent.resolve()
 python_folder = module_folder.parent
@@ -93,19 +84,6 @@ def logger(name):
 
         loggers[name] = logger
         return logger
-
-
-def load_pet_bids_requirements_json(
-    pet_bids_req_json: Union[str, pathlib.Path] = pet_metadata_json
-) -> dict:
-    if type(pet_bids_req_json) is str:
-        pet_bids_req_json = pathlib.Path(pet_bids_req_json)
-    if pet_bids_req_json.is_file():
-        with open(pet_bids_req_json, "r") as infile:
-            reqs = json.load(infile)
-        return reqs
-    else:
-        raise FileNotFoundError(pet_bids_req_json)
 
 
 def flatten_series(series):
@@ -150,12 +128,13 @@ def collect_spreadsheets(folder_path: pathlib.Path):
 
 def single_spreadsheet_reader(
     path_to_spreadsheet: Union[str, pathlib.Path],
-    pet2bids_metadata_json: Union[str, pathlib.Path] = pet_metadata_json,
+    pet2bids_metadata: dict = metadata.PET_metadata,
     dicom_metadata={},
     **kwargs,
 ) -> dict:
 
-    metadata = {}
+    spreadsheet_metadata = {}
+    metadata_fields = pet2bids_metadata
 
     if type(path_to_spreadsheet) is str:
         path_to_spreadsheet = pathlib.Path(path_to_spreadsheet)
@@ -164,24 +143,6 @@ def single_spreadsheet_reader(
         pass
     else:
         raise FileNotFoundError(f"{path_to_spreadsheet} does not exist.")
-
-    if pet2bids_metadata_json:
-        if type(pet_metadata_json) is str:
-            pet2bids_metadata_json = pathlib.Path(pet2bids_metadata_json)
-
-        if pet2bids_metadata_json.is_file():
-            with open(pet_metadata_json, "r") as infile:
-                metadata_fields = json.load(infile)
-        else:
-            raise FileNotFoundError(
-                f"Required metadata file not found at {pet_metadata_json}, check to see if this file exists;"
-                f"\nelse pass path to file formatted to this {permalink_pet_metadata_json} via "
-                f"pet2bids_metadata_json argument in simplest_spreadsheet_reader call."
-            )
-    else:
-        raise FileNotFoundError(
-            f"pet2bids_metadata_json input required for function call, you provided {pet2bids_metadata_json}"
-        )
 
     spreadsheet_dataframe = open_meta_data(path_to_spreadsheet)
 
@@ -192,7 +153,7 @@ def single_spreadsheet_reader(
         for field in metadata_fields[field_level]:
             series = spreadsheet_dataframe.get(field, Series(dtype=numpy.float64))
             if not series.empty:
-                metadata[field] = flatten_series(series)
+                spreadsheet_metadata[field] = flatten_series(series)
             elif (
                 series.empty
                 and field_level == "mandatory"
@@ -204,10 +165,10 @@ def single_spreadsheet_reader(
                 )
 
     # lastly apply any kwargs to the metadata
-    metadata.update(**kwargs)
+    spreadsheet_metadata.update(**kwargs)
 
     # more lastly, check to see if values are of the correct datatype (e.g. string, number, boolean)
-    for field, value in metadata.items():
+    for field, value in spreadsheet_metadata.items():
         # check schema for field
         field_schema_properties = schema["objects"]["metadata"].get(field, None)
         if field_schema_properties:
@@ -220,7 +181,7 @@ def single_spreadsheet_reader(
                     try:
                         check_bool = int(value) / 1
                         if check_bool == 0 or check_bool == 1:
-                            metadata[field] = bool(value)
+                            spreadsheet_metadata[field] = bool(value)
                         else:
                             log.warning(
                                 f"{field} is not boolean, it's value is {value}"
@@ -232,7 +193,7 @@ def single_spreadsheet_reader(
                     log.warning(f"{field} is not string, it's value is {value}")
             else:
                 pass
-    return metadata
+    return spreadsheet_metadata
 
 
 def compress(file_like_object, output_path: str = None):
@@ -325,14 +286,13 @@ def get_version():
     """
     # this scripts directory path
     scripts_dir = pathlib.Path(os.path.dirname(__file__))
-
-    # first try using importlib.metadata.version to determine version
-
-    version = importlib.metadata.version("pypet2bids")
+    try:
+        version = metadata.version("pypet2bids")
+    except Exception:
+        version = None
 
     if not version:
         tomlfile = {}
-
         try:
             # if this is bundled as a package look next to this file for the pyproject.toml
             toml_path = os.path.join(scripts_dir, "pyproject.toml")
@@ -348,9 +308,9 @@ def get_version():
             except FileNotFoundError:
                 pass
 
-        attrs = tomlfile.get("tool", {})
-        poetry = attrs.get("poetry", {})
-        version = poetry.get("version", "")
+        if not version:
+            # PEP 621 / hatchling: version under [project]
+            version = tomlfile.get("project", {}).get("version", "")
 
     return version
 
@@ -834,7 +794,7 @@ def get_recon_method(ReconstructionMethodString: str) -> dict:
         dimension = re.search(search_criteria, ReconMethodName)[0]
 
     # doing some more manipulation of the recon method name to expand it from not so helpful acronyms
-    possible_names =  metadata.PET_reconstruction_methods.get("reconstruction_names", [])
+    possible_names = metadata.PET_reconstruction_methods.get("reconstruction_names", [])
 
     # we want to sort the possible names by longest first that we don't break up an acronym prematurely
     sorted_df = pandas.DataFrame(possible_names).sort_values(
@@ -1204,3 +1164,10 @@ def reorder_isotope(isotope: str) -> str:
     isotope = f"{isotope_num[0]}{e}"
 
     return isotope
+
+def remove_zero_rows(sheet: pandas.DataFrame) -> pandas.DataFrame:
+    zero_rows = sheet.eq(0.0).all(axis=1)
+    if True in zero_rows.values:
+        fixed_tsv = sheet[~zero_rows]
+        sheet = fixed_tsv
+    return sheet    
